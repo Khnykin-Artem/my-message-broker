@@ -40,6 +40,32 @@
 
 ---
 
+## Структуры данных
+
+### Сообщение (Message)
+
+Каждое сообщение, передаваемое через брокер, имеет следующую внутреннюю структуру (сериализуется в JSON или Protocol Buffers):
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "destination": "orders",
+  "type": "queue",
+  "payload": "{\"user\":\"alice\",\"amount\":100}",
+  "timestamp": 1712345678,
+  "ttl": 3600,
+  "delivery_attempts": 0,
+  "status": "pending",
+  "metadata": {
+    "producer_id": "service-a",
+    "content_type": "application/json",
+    "correlation_id": "abc-123"
+  }
+}
+```
+
+---
+
 ## Архитектура
 
 ![Схема архитектуры](assets/архитектура.png)
