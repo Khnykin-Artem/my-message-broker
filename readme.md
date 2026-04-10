@@ -80,3 +80,11 @@
 git clone https://github.com/Khnykin-Artem/tselishchev.git
 cd tselishchev
 make build
+
+## Запуск и тестирование (этап 2)
+
+### Сборка и запуск
+
+```bash
+make build
+make run
