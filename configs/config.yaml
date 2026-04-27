@@ -1,6 +1,26 @@
 server:
   host: "0.0.0.0"
   port: 5555
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+
+storage:
+  type: "wal"                     # "memory" или "wal"
+  data_dir: "./data/wal"
+
+auth:
+  enabled: true
+  tokens:
+    - "admin-token"
+    - "reader-token"
+
+metrics:
+  enabled: true
+  port: 8080
+  path: "/metrics"
+
 broker:
   visibility_timeout_sec: 30
   max_delivery_attempts: 3

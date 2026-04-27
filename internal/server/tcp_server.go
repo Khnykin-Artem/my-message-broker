@@ -2,29 +2,43 @@ package server
 
 import (
     "bufio"
+    "crypto/tls"
     "log"
     "net"
+    "my-message-broker/internal/auth"
     "my-message-broker/internal/broker"
     "my-message-broker/internal/protocol"
 )
 
 type TCPServer struct {
-    host   string
-    port   string
-    broker *broker.Broker
+    host          string
+    port          string
+    tlsConfig     *tls.Config
+    broker        *broker.Broker
+    authenticator *auth.Authenticator
+    authEnabled   bool
 }
 
-func NewTCPServer(host, port string, b *broker.Broker) *TCPServer {
+func NewTCPServer(host, port string, tlsCfg *tls.Config, b *broker.Broker, auth *auth.Authenticator, authEnabled bool) *TCPServer {
     return &TCPServer{
-        host:   host,
-        port:   port,
-        broker: b,
+        host:          host,
+        port:          port,
+        tlsConfig:     tlsCfg,
+        broker:        b,
+        authenticator: auth,
+        authEnabled:   authEnabled,
     }
 }
 
 func (s *TCPServer) Run() error {
     addr := net.JoinHostPort(s.host, s.port)
-    listener, err := net.Listen("tcp", addr)
+    var listener net.Listener
+    var err error
+    if s.tlsConfig != nil {
+        listener, err = tls.Listen("tcp", addr, s.tlsConfig)
+    } else {
+        listener, err = net.Listen("tcp", addr)
+    }
     if err != nil {
         return err
     }
@@ -40,12 +54,32 @@ func (s *TCPServer) Run() error {
     }
 }
 
+type clientState struct {
+    authenticated bool
+}
+
 func (s *TCPServer) handleConnection(conn net.Conn) {
     defer conn.Close()
-    log.Printf("new connection from %s", conn.RemoteAddr())
+    state := &clientState{authenticated: false}
     scanner := bufio.NewScanner(conn)
     for scanner.Scan() {
         line := scanner.Text()
+        // Если аутентификация включена и клиент ещё не аутентифицировался, разрешаем только AUTH
+        if s.authEnabled && !state.authenticated {
+            if cmd, _ := protocol.ParseCommand(line); cmd != nil && cmd.Name == "AUTH" && len(cmd.Args) >= 1 {
+                if s.authenticator.Authenticate(cmd.Args[0]) {
+                    state.authenticated = true
+                    conn.Write([]byte(protocol.RespOk + "\n"))
+                } else {
+                    conn.Write([]byte(protocol.RespErr + " invalid token\n"))
+                    return
+                }
+                continue
+            } else {
+                conn.Write([]byte(protocol.RespErr + " authentication required\n"))
+                continue
+            }
+        }
         cmd, err := protocol.ParseCommand(line)
         if err != nil {
             conn.Write([]byte(protocol.RespErr + " parse error\n"))
@@ -53,12 +87,9 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
         }
         resp := s.broker.ProcessCommand(cmd, conn)
         conn.Write([]byte(resp + "\n"))
-        // если команда SUBSCRIBE, то соединение остаётся открытым для получения сообщений
-        // (они придут асинхронно через sendToSubscriber)
     }
     if err := scanner.Err(); err != nil {
         log.Printf("connection error: %v", err)
     }
-    // при закрытии соединения нужно отписать все подписки этого клиента
     s.broker.RemoveSubscriptionsByConn(conn)
 }

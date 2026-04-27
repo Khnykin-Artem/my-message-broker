@@ -5,12 +5,12 @@ build:
 	go build -o bin/$(BINARY) $(CMD)
 
 run: build
-	./bin/$(BINARY)
+	./bin/$(BINARY) --config configs/config.yaml
 
 test:
 	go test -v ./...
 
 clean:
-	rm -rf bin/
+	rm -rf bin/ data/
 
 .PHONY: build run test clean
