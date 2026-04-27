@@ -39,6 +39,7 @@ func NewBroker(visibilityTimeoutSec, maxDeliveryAttempts int, walPath string, us
     return b, nil
 }
 
+// -------------------- Восстановление из WAL --------------------
 func (b *Broker) recoverFromWal() error {
     return b.wal.Replay(func(entry storage.WalEntry) {
         switch entry.Type {
@@ -103,6 +104,11 @@ func (b *Broker) recoverFromWal() error {
                 delete(b.storage.Queues, name)
                 delete(b.storage.Subscriptions, name)
                 delete(b.storage.RoundRobinIdx, name)
+                for id, p := range b.storage.PendingAcks {
+                    if p.Message.Destination == name {
+                        delete(b.storage.PendingAcks, id)
+                    }
+                }
                 b.storage.mu.Unlock()
             }
         }
@@ -117,6 +123,48 @@ func (b *Broker) logToWal(entry storage.WalEntry) {
     }
 }
 
+// -------------------- Публичные методы для HTTP API --------------------
+func (b *Broker) GetQueuesStats() map[string]int {
+    b.storage.mu.RLock()
+    defer b.storage.mu.RUnlock()
+    stats := make(map[string]int)
+    for name, dest := range b.storage.Destinations {
+        if dest.Type == Queue {
+            stats[name] = len(b.storage.Queues[name])
+        }
+    }
+    return stats
+}
+
+func (b *Broker) DeleteQueue(name string) error {
+    b.storage.mu.Lock()
+    defer b.storage.mu.Unlock()
+    dest, exists := b.storage.Destinations[name]
+    if !exists {
+        return fmt.Errorf("queue not found")
+    }
+    if dest.Type != Queue {
+        return fmt.Errorf("destination is not a queue")
+    }
+    delete(b.storage.Destinations, name)
+    delete(b.storage.Queues, name)
+    delete(b.storage.Subscriptions, name)
+    delete(b.storage.RoundRobinIdx, name)
+    for id, pending := range b.storage.PendingAcks {
+        if pending.Message.Destination == name {
+            delete(b.storage.PendingAcks, id)
+        }
+    }
+    if b.wal != nil {
+        b.logToWal(storage.WalEntry{
+            Type: storage.EntryDelete,
+            Data: map[string]interface{}{"name": name},
+        })
+    }
+    return nil
+}
+
+// -------------------- Обработка команд --------------------
 func (b *Broker) ProcessCommand(cmd *protocol.Command, conn net.Conn) string {
     if cmd == nil {
         return protocol.RespErr + " empty command"
@@ -153,6 +201,7 @@ func (b *Broker) ProcessCommand(cmd *protocol.Command, conn net.Conn) string {
     }
 }
 
+// ---------- CREATE / DELETE ----------
 func (b *Broker) handleCreate(cmd *protocol.Command) string {
     if len(cmd.Args) < 2 {
         return protocol.RespErr + " usage: CREATE QUEUE|TOPIC name"
@@ -214,13 +263,12 @@ func (b *Broker) handleDelete(cmd *protocol.Command) string {
     delete(b.storage.RoundRobinIdx, name)
     b.logToWal(storage.WalEntry{
         Type: storage.EntryDelete,
-        Data: map[string]interface{}{
-            "name": name,
-        },
+        Data: map[string]interface{}{"name": name},
     })
     return protocol.RespOk
 }
 
+// ---------- PUBLISH ----------
 func (b *Broker) handlePublish(cmd *protocol.Command) string {
     if len(cmd.Args) < 2 {
         return protocol.RespErr + " usage: PUBLISH name payload"
@@ -265,6 +313,7 @@ func (b *Broker) handlePublish(cmd *protocol.Command) string {
     }
 }
 
+// ---------- SUBSCRIBE / UNSUBSCRIBE ----------
 func (b *Broker) handleSubscribe(cmd *protocol.Command, conn net.Conn) string {
     if len(cmd.Args) < 1 {
         return protocol.RespErr + " usage: SUBSCRIBE name"
@@ -305,6 +354,7 @@ func (b *Broker) handleUnsubscribe(cmd *protocol.Command, conn net.Conn) string 
     return protocol.RespOk
 }
 
+// ---------- ACK ----------
 func (b *Broker) handleAck(cmd *protocol.Command) string {
     if len(cmd.Args) < 1 {
         return protocol.RespErr + " usage: ACK messageID"
@@ -335,6 +385,7 @@ func (b *Broker) handleAck(cmd *protocol.Command) string {
     return protocol.RespOk
 }
 
+// ---------- Доставка и таймауты ----------
 func (b *Broker) sendToSubscriber(sub *Subscription, msg *Message) error {
     line := fmt.Sprintf("MSG %s %s %s\n", msg.ID, msg.Destination, msg.Payload)
     _, err := sub.Conn.Write([]byte(line))
@@ -425,22 +476,7 @@ func (b *Broker) retryTimeoutChecker() {
     }
 }
 
-func (b *Broker) RemoveSubscriptionsByConn(conn net.Conn) {
-    b.storage.mu.Lock()
-    defer b.storage.mu.Unlock()
-    for dest, subs := range b.storage.Subscriptions {
-        newSubs := []*Subscription{}
-        for _, sub := range subs {
-            if sub.Conn != conn {
-                newSubs = append(newSubs, sub)
-            }
-        }
-        if len(newSubs) != len(subs) {
-            b.storage.Subscriptions[dest] = newSubs
-        }
-    }
-}
-
+// ---------- LIST / STATS / PURGE ----------
 func (b *Broker) handleList() string {
     b.storage.mu.RLock()
     defer b.storage.mu.RUnlock()
@@ -485,4 +521,21 @@ func (b *Broker) handlePurge(queueName string) string {
         }
     }
     return protocol.RespOk
+}
+
+// ---------- Вспомогательные ----------
+func (b *Broker) RemoveSubscriptionsByConn(conn net.Conn) {
+    b.storage.mu.Lock()
+    defer b.storage.mu.Unlock()
+    for dest, subs := range b.storage.Subscriptions {
+        newSubs := []*Subscription{}
+        for _, sub := range subs {
+            if sub.Conn != conn {
+                newSubs = append(newSubs, sub)
+            }
+        }
+        if len(newSubs) != len(subs) {
+            b.storage.Subscriptions[dest] = newSubs
+        }
+    }
 }
