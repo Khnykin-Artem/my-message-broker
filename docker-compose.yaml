@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  broker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5555:5555"
+      - "8080:8080"
+    volumes:
+      - ./data:/root/data
+    environment:
+      - BROKER_STORAGE_TYPE=wal
+      - BROKER_AUTH_ENABLED=false
+    networks:
+      - demo-net
+
+  producer:
+    build:
+      context: .
+      dockerfile: demo/producer/Dockerfile
+    depends_on:
+      - broker
+    environment:
+      - BROKER_ADDR=broker:5555
+    networks:
+      - demo-net
+
+  consumer:
+    build:
+      context: .
+      dockerfile: demo/consumer/Dockerfile
+    depends_on:
+      - broker
+    environment:
+      - BROKER_ADDR=broker:5555
+      - CONSUMER_ID=worker1
+    networks:
+      - demo-net
+
+  monitor:
+    build:
+      context: .
+      dockerfile: demo/monitor/Dockerfile
+    depends_on:
+      - broker
+    environment:
+      - BROKER_ADDR=broker:5555
+    networks:
+      - demo-net
+
+networks:
+  demo-net:
