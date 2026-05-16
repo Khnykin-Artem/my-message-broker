@@ -13,6 +13,7 @@ const (
     EntryAck     EntryType = "ACK"
     EntryCreate  EntryType = "CREATE"
     EntryDelete  EntryType = "DELETE"
+    EntryDurableSub EntryType = "DURABLE_SUB"
 )
 
 type WalEntry struct {

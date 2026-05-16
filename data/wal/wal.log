@@ -13,3 +13,19 @@
 {"type":"PUBLISH","data":{"deliveryAttempt":0,"destination":"news","id":"24b1d7a4-ef77-40ce-972b-7fc42ccff3e2","payload":"helloaf;dslk","status":"pending","timestamp":1777025444}}
 {"type":"PUBLISH","data":{"deliveryAttempt":0,"destination":"tasks","id":"cef7f0f6-34ee-4692-8f11-2a99016e9f9b","payload":"helloooooo","status":"pending","timestamp":1777025461}}
 {"type":"CREATE","data":{"name":"users","type":"QUEUE"}}
+{"type":"PUBLISH","data":{"deliveryAttempt":0,"destination":"news","id":"ee40b91a-b4c2-4b57-9230-6e12d2905088","payload":"hi","status":"pending","timestamp":1777294131}}
+{"type":"PUBLISH","data":{"deliveryAttempt":0,"destination":"news","id":"875b25e2-8dff-449a-a2cb-8c4fe29b8494","payload":"fhas;dklf","status":"pending","timestamp":1777294359}}
+{"type":"DURABLE_SUB","data":{"consumerID":"u1","offset":-1,"topic":"news"}}
+{"type":"PUBLISH","data":{"destination":"news","id":"4852b38a-d0a6-4776-9bd4-a0a088ba1125","payload":"hi","timestamp":1777295917}}
+{"type":"PUBLISH","data":{"destination":"news","id":"2d802ba0-a88f-4bb5-80cb-4e0c98dba020","payload":"fs;hdl","timestamp":1777295931}}
+{"type":"DURABLE_SUB","data":{"consumerID":"u1","offset":4,"topic":"news"}}
+{"type":"DURABLE_SUB","data":{"consumerID":"u2","offset":-1,"topic":"news"}}
+{"type":"PUBLISH","data":{"destination":"news","id":"dcf97035-a35a-40bd-a6a3-1d1b42ff5237","payload":"artem","timestamp":1777296668}}
+{"type":"DURABLE_SUB","data":{"consumerID":"u2","offset":6,"topic":"news"}}
+{"type":"CREATE","data":{"name":"test_sdk","type":"TOPIC"}}
+{"type":"DURABLE_SUB","data":{"consumerID":"myclient1","offset":-1,"topic":"test_sdk"}}
+{"type":"PUBLISH","data":{"destination":"test_sdk","id":"ea723304-fd3c-47c2-b7f4-6cead12ab9c1","payload":"Hello from SDK!","timestamp":1777297195}}
+{"type":"DURABLE_SUB","data":{"consumerID":"myclient1","offset":-1,"topic":"test_sdk"}}
+{"type":"PUBLISH","data":{"destination":"test_sdk","id":"4f2210f4-d788-4608-8fda-87a4a27eb684","payload":"Hello from SDK!","timestamp":1777297288}}
+{"type":"DURABLE_SUB","data":{"consumerID":"myclient1","offset":0,"topic":"test_sdk"}}
+{"type":"PUBLISH","data":{"destination":"test_sdk","id":"01fc68e8-4996-4e21-988b-e9bd73e5b14a","payload":"Hello from SDK!","timestamp":1777297317}}

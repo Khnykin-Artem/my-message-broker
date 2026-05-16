@@ -11,7 +11,7 @@ storage:
   data_dir: "./data/wal"
 
 auth:
-  enabled: true
+  enabled: false
   tokens:
     - "admin-token"
     - "reader-token"

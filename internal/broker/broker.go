@@ -5,6 +5,7 @@ import (
     "log"
     "net"
     "strings"
+    "sync"
     "time"
 
     "github.com/google/uuid"
@@ -12,18 +13,38 @@ import (
     "my-message-broker/internal/storage"
 )
 
+// ---------- Структуры ----------
 type Broker struct {
     storage              *Storage
     visibilityTimeoutSec int
     maxDeliveryAttempts  int
     wal                  *storage.Wal
+
+    // durable subscriptions: topic -> consumerID -> DurableSubInfo
+    durableSubs   map[string]map[string]*DurableSubInfo
+    muDurable     sync.RWMutex
+    // хранение сообщений топиков (ограниченной глубины)
+    topicMessages map[string][]*Message
+    topicMsgMu    sync.RWMutex
+    maxTopicMsgs  int
 }
 
+type DurableSubInfo struct {
+    ConsumerID    string
+    Topic         string
+    LastMsgOffset int // индекс последнего полученного сообщения в slice topicMessages[topic]
+    // для восстановления offset из WAL
+}
+
+// ---------- Конструктор ----------
 func NewBroker(visibilityTimeoutSec, maxDeliveryAttempts int, walPath string, useWal bool) (*Broker, error) {
     b := &Broker{
         storage:              NewStorage(),
         visibilityTimeoutSec: visibilityTimeoutSec,
         maxDeliveryAttempts:  maxDeliveryAttempts,
+        durableSubs:          make(map[string]map[string]*DurableSubInfo),
+        topicMessages:        make(map[string][]*Message),
+        maxTopicMsgs:         1000, // хранить последние 1000 сообщений в топике
     }
     if useWal && walPath != "" {
         wal, err := storage.NewWal(walPath)
@@ -69,14 +90,37 @@ func (b *Broker) recoverFromWal() error {
                     Destination:     data["destination"].(string),
                     Payload:         data["payload"].(string),
                     Timestamp:       int64(data["timestamp"].(float64)),
-                    DeliveryAttempt: int(data["deliveryAttempt"].(float64)),
-                    Status:          MessageStatus(data["status"].(string)),
+                    DeliveryAttempt: 0,
+                    Status:          StatusPending,
                 }
                 b.storage.mu.Lock()
                 if dest, exists := b.storage.Destinations[msg.Destination]; exists && dest.Type == Queue {
                     b.storage.Queues[msg.Destination] = append(b.storage.Queues[msg.Destination], msg)
+                } else if dest != nil && dest.Type == Topic {
+                    b.topicMsgMu.Lock()
+                    b.topicMessages[msg.Destination] = append(b.topicMessages[msg.Destination], msg)
+                    if len(b.topicMessages[msg.Destination]) > b.maxTopicMsgs {
+                        b.topicMessages[msg.Destination] = b.topicMessages[msg.Destination][1:]
+                    }
+                    b.topicMsgMu.Unlock()
                 }
                 b.storage.mu.Unlock()
+            }
+        case storage.EntryDurableSub:
+            if data, ok := entry.Data.(map[string]interface{}); ok {
+                topic := data["topic"].(string)
+                consumerID := data["consumerID"].(string)
+                offset := int(data["offset"].(float64))
+                b.muDurable.Lock()
+                if _, ok := b.durableSubs[topic]; !ok {
+                    b.durableSubs[topic] = make(map[string]*DurableSubInfo)
+                }
+                b.durableSubs[topic][consumerID] = &DurableSubInfo{
+                    ConsumerID:    consumerID,
+                    Topic:         topic,
+                    LastMsgOffset: offset,
+                }
+                b.muDurable.Unlock()
             }
         case storage.EntryAck:
             if data, ok := entry.Data.(map[string]interface{}); ok {
@@ -104,11 +148,13 @@ func (b *Broker) recoverFromWal() error {
                 delete(b.storage.Queues, name)
                 delete(b.storage.Subscriptions, name)
                 delete(b.storage.RoundRobinIdx, name)
-                for id, p := range b.storage.PendingAcks {
-                    if p.Message.Destination == name {
-                        delete(b.storage.PendingAcks, id)
-                    }
-                }
+                // очистить durable подписки на этот топик
+                b.muDurable.Lock()
+                delete(b.durableSubs, name)
+                b.muDurable.Unlock()
+                b.topicMsgMu.Lock()
+                delete(b.topicMessages, name)
+                b.topicMsgMu.Unlock()
                 b.storage.mu.Unlock()
             }
         }
@@ -162,6 +208,74 @@ func (b *Broker) DeleteQueue(name string) error {
         })
     }
     return nil
+}
+
+// -------------------- Durable subscription logic --------------------
+func (b *Broker) durableSubscribe(topic, consumerID string, conn net.Conn) string {
+    b.muDurable.Lock()
+    defer b.muDurable.Unlock()
+    b.storage.mu.Lock()
+    defer b.storage.mu.Unlock()
+
+    dest, exists := b.storage.Destinations[topic]
+    if !exists || dest.Type != Topic {
+        return protocol.RespErr + " topic not found"
+    }
+
+    // Восстанавливаем или создаём info
+    if _, ok := b.durableSubs[topic]; !ok {
+        b.durableSubs[topic] = make(map[string]*DurableSubInfo)
+    }
+    info, ok := b.durableSubs[topic][consumerID]
+    if !ok {
+        info = &DurableSubInfo{
+            ConsumerID:    consumerID,
+            Topic:         topic,
+            LastMsgOffset: -1,
+        }
+        b.durableSubs[topic][consumerID] = info
+    }
+
+    // Записываем в WAL факт durable подписки
+    b.logToWal(storage.WalEntry{
+        Type: storage.EntryDurableSub,
+        Data: map[string]interface{}{
+            "topic":      topic,
+            "consumerID": consumerID,
+            "offset":     info.LastMsgOffset,
+        },
+    })
+
+    // Отправляем все сообщения, которые были накоплены с момента последнего offset
+    b.topicMsgMu.RLock()
+    msgs := b.topicMessages[topic]
+    b.topicMsgMu.RUnlock()
+    startIdx := info.LastMsgOffset + 1
+    if startIdx < 0 {
+        startIdx = 0
+    }
+    for i := startIdx; i < len(msgs); i++ {
+        go b.sendToSubscriberTopic(conn, msgs[i])
+    }
+    if len(msgs) > 0 {
+        info.LastMsgOffset = len(msgs) - 1
+    } else {
+        info.LastMsgOffset = -1
+    }
+
+    // Также добавляем обычную подписку для мгновенной доставки новых сообщений
+    sub := NewSubscription(uuid.New().String(), topic, conn)
+    b.storage.Subscriptions[topic] = append(b.storage.Subscriptions[topic], sub)
+    return protocol.RespOk
+}
+
+// отправка сообщения durable-подписчику (пишем прямо в сокет)
+func (b *Broker) sendToSubscriberTopic(conn net.Conn, msg *Message) {
+    line := fmt.Sprintf("MSG %s %s %s\n", msg.ID, msg.Destination, msg.Payload)
+    _, err := conn.Write([]byte(line))
+    if err != nil {
+        log.Printf("failed to send durable message to %s: %v", conn.RemoteAddr(), err)
+    }
 }
 
 // -------------------- Обработка команд --------------------
@@ -227,6 +341,12 @@ func (b *Broker) handleCreate(cmd *protocol.Command) string {
         if _, ok := b.storage.Queues[name]; !ok {
             b.storage.Queues[name] = []*Message{}
         }
+    } else {
+        b.topicMsgMu.Lock()
+        if _, ok := b.topicMessages[name]; !ok {
+            b.topicMessages[name] = []*Message{}
+        }
+        b.topicMsgMu.Unlock()
     }
     b.logToWal(storage.WalEntry{
         Type: storage.EntryCreate,
@@ -257,6 +377,13 @@ func (b *Broker) handleDelete(cmd *protocol.Command) string {
             return protocol.RespErr + " queue has pending messages"
         }
         delete(b.storage.Queues, name)
+    } else {
+        b.topicMsgMu.Lock()
+        delete(b.topicMessages, name)
+        b.topicMsgMu.Unlock()
+        b.muDurable.Lock()
+        delete(b.durableSubs, name)
+        b.muDurable.Unlock()
     }
     delete(b.storage.Destinations, name)
     delete(b.storage.Subscriptions, name)
@@ -285,26 +412,30 @@ func (b *Broker) handlePublish(cmd *protocol.Command) string {
     b.logToWal(storage.WalEntry{
         Type: storage.EntryPublish,
         Data: map[string]interface{}{
-            "id":              msg.ID,
-            "destination":     msg.Destination,
-            "payload":         msg.Payload,
-            "timestamp":       msg.Timestamp,
-            "deliveryAttempt": msg.DeliveryAttempt,
-            "status":          string(msg.Status),
+            "id":          msg.ID,
+            "destination": msg.Destination,
+            "payload":     msg.Payload,
+            "timestamp":   msg.Timestamp,
         },
     })
     if dest.Type == Topic {
+        // сохраняем сообщение топика
+        b.topicMsgMu.Lock()
+        b.topicMessages[name] = append(b.topicMessages[name], msg)
+        if len(b.topicMessages[name]) > b.maxTopicMsgs {
+            b.topicMessages[name] = b.topicMessages[name][1:]
+        }
+        b.topicMsgMu.Unlock()
+        // рассылка активным подписчикам
         b.storage.mu.RLock()
         subs := b.storage.Subscriptions[name]
         b.storage.mu.RUnlock()
-        if len(subs) == 0 {
-            return protocol.RespOk
-        }
         for _, sub := range subs {
             go b.sendToSubscriber(sub, msg)
         }
         return protocol.RespOk
     } else {
+        // очередь
         b.storage.mu.Lock()
         b.storage.Queues[name] = append(b.storage.Queues[name], msg)
         b.storage.mu.Unlock()
@@ -316,15 +447,26 @@ func (b *Broker) handlePublish(cmd *protocol.Command) string {
 // ---------- SUBSCRIBE / UNSUBSCRIBE ----------
 func (b *Broker) handleSubscribe(cmd *protocol.Command, conn net.Conn) string {
     if len(cmd.Args) < 1 {
-        return protocol.RespErr + " usage: SUBSCRIBE name"
+        return protocol.RespErr + " usage: SUBSCRIBE destination [consumer_id]"
     }
     name := cmd.Args[0]
+    consumerID := ""
+    if len(cmd.Args) >= 2 {
+        consumerID = cmd.Args[1]
+    }
     b.storage.mu.Lock()
-    defer b.storage.mu.Unlock()
     dest, exists := b.storage.Destinations[name]
+    b.storage.mu.Unlock()
     if !exists {
         return protocol.RespErr + " destination not found"
     }
+    // durable подписка на топик
+    if dest.Type == Topic && consumerID != "" {
+        return b.durableSubscribe(name, consumerID, conn)
+    }
+    // обычная подписка (временная)
+    b.storage.mu.Lock()
+    defer b.storage.mu.Unlock()
     sub := NewSubscription(uuid.New().String(), name, conn)
     b.storage.Subscriptions[name] = append(b.storage.Subscriptions[name], sub)
     if dest.Type == Queue {
@@ -338,6 +480,7 @@ func (b *Broker) handleUnsubscribe(cmd *protocol.Command, conn net.Conn) string 
         return protocol.RespErr + " usage: UNSUBSCRIBE name"
     }
     name := cmd.Args[0]
+    // Проверяем, может быть это durable подписка? по conn удаляем только обычные
     b.storage.mu.Lock()
     defer b.storage.mu.Unlock()
     subs := b.storage.Subscriptions[name]
@@ -385,7 +528,7 @@ func (b *Broker) handleAck(cmd *protocol.Command) string {
     return protocol.RespOk
 }
 
-// ---------- Доставка и таймауты ----------
+// ---------- Доставка для очередей (не durable) ----------
 func (b *Broker) sendToSubscriber(sub *Subscription, msg *Message) error {
     line := fmt.Sprintf("MSG %s %s %s\n", msg.ID, msg.Destination, msg.Payload)
     _, err := sub.Conn.Write([]byte(line))
@@ -502,7 +645,15 @@ func (b *Broker) handleStats(name string) string {
             depth, len(b.storage.PendingAcks))
     } else {
         subs := len(b.storage.Subscriptions[name])
-        stats += fmt.Sprintf("Subscribers: %d\n", subs)
+        stats += fmt.Sprintf("Active subscribers: %d\n", subs)
+        // дополнительно durable subscribers
+        b.muDurable.RLock()
+        durableCount := 0
+        if m, ok := b.durableSubs[name]; ok {
+            durableCount = len(m)
+        }
+        b.muDurable.RUnlock()
+        stats += fmt.Sprintf("Durable subscribers: %d\n", durableCount)
     }
     return stats
 }
@@ -523,7 +674,6 @@ func (b *Broker) handlePurge(queueName string) string {
     return protocol.RespOk
 }
 
-// ---------- Вспомогательные ----------
 func (b *Broker) RemoveSubscriptionsByConn(conn net.Conn) {
     b.storage.mu.Lock()
     defer b.storage.mu.Unlock()
